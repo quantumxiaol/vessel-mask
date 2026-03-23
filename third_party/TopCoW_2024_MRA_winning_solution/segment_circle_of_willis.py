@@ -4,36 +4,73 @@ import SimpleITK as sitk
 import os
 import torch
 import nibabel as nib
+from pathlib import Path
 from batchgenerators.utilities.file_and_folder_operations import join
 from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 from nnunetv2.imageio.simpleitk_reader_writer import SimpleITKIO
 from nnunetv2.ensembling.ensemble import ensemble_folders
 import glob
+from dotenv import load_dotenv
 
 from ultralytics import YOLO
 import cv2
 
 #######################################################################################
-YOLO_FILE_PATH = './models/yolo-cow-detection.pt'
-SEGMODEL_DIR_PATH = './models/topcow-claim-models'
-IMG_FOLDER = './folder_to_predict'
-SEGMENTATION_FOLDER = './segmentations'
+# Load .env from current working directory if present
+load_dotenv()
+
+YOLO_FILE_PATH = os.getenv(
+    "TOPCOW_YOLO_FILE_PATH",
+    os.getenv("VESSEL_MASK_YOLO_PATH", "./models/yolo-cow-detection.pt"),
+)
+SEGMODEL_DIR_PATH = os.getenv(
+    "TOPCOW_SEGMODEL_DIR_PATH",
+    os.getenv("VESSEL_MASK_SEGMODEL_DIR", "./models/topcow-claim-models"),
+)
+IMG_FOLDER = os.getenv("TOPCOW_IMG_FOLDER", "./folder_to_predict")
+SEGMENTATION_FOLDER = os.getenv("TOPCOW_SEGMENTATION_FOLDER", "./outputs_segmentations")
+
+DEVICE_STR = os.getenv("TOPCOW_DEVICE", os.getenv("VESSEL_MASK_DEVICE", "cuda:0"))
+TORCH_LOAD_WEIGHTS_ONLY = os.getenv("TOPCOW_TORCH_LOAD_WEIGHTS_ONLY", "false").strip().lower()
 #######################################################################################
+
+
+def _patch_torch_load_default_weights_only():
+    """
+    Compat for PyTorch >= 2.6 where torch.load defaults to weights_only=True.
+    TopCoW checkpoints contain python objects and require weights_only=False.
+    """
+    if getattr(torch.load, "__name__", "") == "_topcow_torch_load_compat":
+        return
+
+    original_torch_load = torch.load
+
+    def _topcow_torch_load_compat(*args, **kwargs):
+        if "weights_only" not in kwargs:
+            kwargs["weights_only"] = TORCH_LOAD_WEIGHTS_ONLY == "true"
+        return original_torch_load(*args, **kwargs)
+
+    torch.load = _topcow_torch_load_compat
+
+
+_patch_torch_load_default_weights_only()
 
 def main():
     print("Starting segmentation...")
     print("Model:", SEGMODEL_DIR_PATH)
+    print("Input:", IMG_FOLDER)
+    print("Output:", SEGMENTATION_FOLDER)
+    print("Device:", DEVICE_STR)
 
     if not os.path.exists(SEGMENTATION_FOLDER):
         os.makedirs(SEGMENTATION_FOLDER)
 
-    # Load the NIfTI image paths
-    img_files = sorted(os.listdir(IMG_FOLDER))
-    img_files = [img_path for img_path in img_files if img_path.endswith(".nii.gz")]
+    img_files = resolve_input_paths(IMG_FOLDER)
+    if not img_files:
+        raise FileNotFoundError(f"No .nii.gz files found in input: {IMG_FOLDER}")
 
     for img_file in img_files:
         # Load the NIfTI image
-        img_file = os.path.join(IMG_FOLDER, img_file)
         print("------------------------------------")
         print(os.path.basename(img_file))
 
@@ -57,9 +94,37 @@ def main():
     print("Segmentation done!")
 
 
+def resolve_input_paths(input_path: str) -> list[str]:
+    input_obj = Path(input_path).expanduser()
+    if input_obj.is_file():
+        if not input_obj.name.endswith(".nii.gz"):
+            raise ValueError(f"Input file must end with .nii.gz: {input_obj}")
+        return [str(input_obj.resolve())]
+
+    if input_obj.is_dir():
+        return sorted(
+            str(p.resolve())
+            for p in input_obj.glob("*.nii.gz")
+            if p.is_file()
+        )
+
+    raise FileNotFoundError(f"Input path does not exist: {input_obj}")
+
+
 def load_nifti_file(nifti_path):
     nifti_img = nib.load(nifti_path)
-    nifti_data = nifti_img.get_fdata()
+    try:
+        nifti_data = nifti_img.get_fdata()
+    except Exception as e:
+        print(f"Warning: nib.get_fdata failed for {nifti_path}: {e}")
+        print("Trying fallback conversion for vector/structured NIfTI input.")
+        nifti_data = _coerce_to_scalar_volume(nifti_img)
+
+    nifti_data = np.asarray(nifti_data)
+    if nifti_data.ndim != 3:
+        raise ValueError(
+            f"Expected 3D scalar volume after loading, but got shape {nifti_data.shape} for {nifti_path}."
+        )
     return nifti_data, nifti_img
 
 
@@ -70,10 +135,47 @@ def save_nifti_file(data, output_path, reference_nifti_path):
     """
     reference_img = nib.load(reference_nifti_path)
     affine = reference_img.affine
-    header = reference_img.header
+    header = reference_img.header.copy()
+    if np.issubdtype(np.asarray(data).dtype, np.integer):
+        header.set_data_dtype(np.asarray(data).dtype)
+    else:
+        header.set_data_dtype(np.float32)
 
     nifti_img = nib.Nifti1Image(data, affine, header)
     nib.save(nifti_img, output_path)
+
+
+def _coerce_to_scalar_volume(nifti_img):
+    """
+    Convert vector/structured NIfTI payloads to a 3D scalar volume.
+    """
+    raw = np.asanyarray(nifti_img.dataobj)
+
+    # Case 1: structured dtype, e.g. RGB24 as fields (R, G, B)
+    if raw.dtype.fields is not None:
+        field_names = raw.dtype.names or ()
+        if {"R", "G", "B"}.issubset(set(field_names)):
+            rgb = np.stack(
+                [raw["R"].astype(np.float32), raw["G"].astype(np.float32), raw["B"].astype(np.float32)],
+                axis=-1,
+            )
+            gray = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+            print("Detected structured RGB NIfTI. Converted to grayscale volume.")
+            return gray
+
+        # Generic structured fallback: use first field
+        first = field_names[0]
+        print(f"Detected structured dtype with fields {field_names}. Using first field '{first}'.")
+        return raw[first].astype(np.float32)
+
+    # Case 2: explicit channel axis in last dimension
+    if raw.ndim == 4 and raw.shape[-1] in (3, 4):
+        rgb = raw[..., :3].astype(np.float32)
+        gray = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+        print("Detected multi-channel 4D NIfTI. Converted first 3 channels to grayscale volume.")
+        return gray
+
+    return raw.astype(np.float32)
 
 
 def window_CTA(CTA_array, WL=300, WW=1000):
@@ -248,12 +350,15 @@ def segment_nifti(img_file) -> np.array:
     shutil.rmtree(temp_save_path_seg_ensemble, ignore_errors=True)
     os.makedirs(temp_save_path_seg_ensemble)
 
+    resolved_device = resolve_device(DEVICE_STR)
+    perform_on_device = str(resolved_device).startswith("cuda")
+
     predictor_best = nnUNetPredictor(
         tile_step_size=0.5,
         use_gaussian=True,
         use_mirroring=False,
-        perform_everything_on_device=True,
-        device=torch.device('cuda', 0),
+        perform_everything_on_device=perform_on_device,
+        device=resolved_device,
         verbose=False,
         verbose_preprocessing=False,
         allow_tqdm=True
@@ -262,8 +367,8 @@ def segment_nifti(img_file) -> np.array:
         tile_step_size=0.5,
         use_gaussian=True,
         use_mirroring=False,
-        perform_everything_on_device=True,
-        device=torch.device('cuda', 0),
+        perform_everything_on_device=perform_on_device,
+        device=resolved_device,
         verbose=False,
         verbose_preprocessing=False,
         allow_tqdm=True
@@ -327,6 +432,29 @@ def segment_nifti(img_file) -> np.array:
     shutil.rmtree(temp_save_path_seg_ensemble)
 
     return pred_array
+
+
+def resolve_device(device_str: str):
+    normalized = device_str.strip().lower()
+    if normalized == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda", 0)
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    if normalized.startswith("cuda:"):
+        idx = int(normalized.split(":", 1)[1])
+        return torch.device("cuda", idx)
+    if normalized == "cuda":
+        return torch.device("cuda", 0)
+    if normalized == "mps":
+        return torch.device("mps")
+    if normalized == "cpu":
+        return torch.device("cpu")
+
+    # Let torch validate any other custom device strings
+    return torch.device(device_str)
 
 
 if __name__ == "__main__":

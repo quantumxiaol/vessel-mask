@@ -12,3 +12,6 @@ wheels/
 .env
 checkpoints/
 logs/
+test_data/
+outputs_segmentations/
+temp_save*/
