@@ -61,6 +61,7 @@ def main():
     print("Input:", IMG_FOLDER)
     print("Output:", SEGMENTATION_FOLDER)
     print("Device:", DEVICE_STR)
+    print("Resolved device:", resolve_device(DEVICE_STR))
 
     if not os.path.exists(SEGMENTATION_FOLDER):
         os.makedirs(SEGMENTATION_FOLDER)
@@ -189,7 +190,7 @@ def window_CTA(CTA_array, WL=300, WW=1000):
     return windowed_CTA_array
 
 
-def process_nifti_with_yolo(model, nifti_path, output_crop_path):
+def process_nifti_with_yolo(model, nifti_path, output_crop_path, yolo_device):
     """
     Perform YOLO inference on each 2D slice of a NIfTI volume and output the cropped 3D volume.
     The 3D crop is centered around the median bounding box center, and the crop size is based on the median bounding box size.
@@ -226,7 +227,7 @@ def process_nifti_with_yolo(model, nifti_path, output_crop_path):
         # slice_rgb = np.stack((normalized_slice, normalized_slice, normalized_slice), axis=-1)
 
         # Perform YOLO inference on the 2D slice
-        results = model.predict(source=slice_rgb, verbose=False)
+        results = model.predict(source=slice_rgb, verbose=False, device=yolo_device)
 
         # Loop through detected bounding boxes
         for result in results:
@@ -325,6 +326,9 @@ def segment_nifti(img_file) -> np.array:
         np.array - prediction
     """
 
+    resolved_device = resolve_device(DEVICE_STR)
+    yolo_device = resolve_yolo_device_arg(resolved_device)
+
     ### YOLO DETECTION ###
     yolo_model = YOLO(YOLO_FILE_PATH)  # Load the trained YOLO model
 
@@ -334,7 +338,12 @@ def segment_nifti(img_file) -> np.array:
     os.makedirs(temp_save_path)
     ROI_path = os.path.join(temp_save_path, "ROI_0000.nii.gz")
 
-    _, ROI_dict, original_size = process_nifti_with_yolo(yolo_model, img_file, ROI_path)
+    _, ROI_dict, original_size = process_nifti_with_yolo(
+        yolo_model,
+        img_file,
+        ROI_path,
+        yolo_device=yolo_device,
+    )
 
     print(f"list temp_save_path = {os.listdir(temp_save_path)}")
 
@@ -350,7 +359,6 @@ def segment_nifti(img_file) -> np.array:
     shutil.rmtree(temp_save_path_seg_ensemble, ignore_errors=True)
     os.makedirs(temp_save_path_seg_ensemble)
 
-    resolved_device = resolve_device(DEVICE_STR)
     perform_on_device = str(resolved_device).startswith("cuda")
 
     predictor_best = nnUNetPredictor(
@@ -455,6 +463,14 @@ def resolve_device(device_str: str):
 
     # Let torch validate any other custom device strings
     return torch.device(device_str)
+
+
+def resolve_yolo_device_arg(device: torch.device) -> str:
+    if device.type == "cuda":
+        return str(0 if device.index is None else device.index)
+    if device.type == "mps":
+        return "mps"
+    return "cpu"
 
 
 if __name__ == "__main__":
