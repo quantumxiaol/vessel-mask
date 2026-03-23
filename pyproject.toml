@@ -1,7 +1,32 @@
 [project]
 name = "vessel-mask"
 version = "0.1.0"
-description = "Add your description here"
+description = "Circle of Willis vessel-mask runner built on TopCoW"
 readme = "README.md"
-requires-python = ">=3.10"
-dependencies = []
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "nibabel",
+    "numpy",
+    "opencv-python",
+    "SimpleITK",
+    "torch",
+    "ultralytics",
+    "nnunetv2",
+    "python-dotenv>=1.2.2",
+]
+
+[project.scripts]
+vessel-mask-topcow = "vessel_mask.cli:main"
+
+[tool.uv.sources]
+nnunetv2 = { path = "third_party/TopCoW_2024_MRA_winning_solution/topcow-2024-nnunet", editable = true }
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
