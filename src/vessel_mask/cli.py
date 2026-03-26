@@ -39,6 +39,42 @@ def build_parser(defaults: RuntimeConfig) -> argparse.ArgumentParser:
         default=defaults.device,
         help="Torch device string: auto, cuda:0, mps, or cpu",
     )
+    parser.add_argument(
+        "--cta-window-mode",
+        default=defaults.cta_window_mode,
+        choices=("auto", "on", "off"),
+        help="CTA windowing mode: auto (filename heuristic), on, or off",
+    )
+    parser.add_argument(
+        "--cta-window-level",
+        type=float,
+        default=defaults.cta_window_level,
+        help="CTA window level (WL), used when CTA windowing is enabled",
+    )
+    parser.add_argument(
+        "--cta-window-width",
+        type=float,
+        default=defaults.cta_window_width,
+        help="CTA window width (WW), used when CTA windowing is enabled",
+    )
+    parser.add_argument(
+        "--yolo-conf",
+        type=float,
+        default=defaults.yolo_conf,
+        help="YOLO confidence threshold in [0, 1]",
+    )
+    parser.add_argument(
+        "--roi-pad-xy",
+        type=int,
+        default=defaults.roi_pad_xy,
+        help="ROI crop padding (voxels) in x/y direction",
+    )
+    parser.add_argument(
+        "--roi-pad-z",
+        type=int,
+        default=defaults.roi_pad_z,
+        help="ROI crop padding (voxels) in z direction",
+    )
     return parser
 
 
@@ -52,6 +88,13 @@ def main() -> None:
     args = parser.parse_args()
     resolved_device = resolve_device(args.device)
 
+    if args.cta_window_width <= 0:
+        parser.error("--cta-window-width must be > 0")
+    if not 0.0 <= args.yolo_conf <= 1.0:
+        parser.error("--yolo-conf must be within [0, 1]")
+    if args.roi_pad_xy < 0 or args.roi_pad_z < 0:
+        parser.error("--roi-pad-xy and --roi-pad-z must be >= 0")
+
     run_topcow_single(
         input_nifti=Path(args.input),
         output_binary_mask=Path(args.output),
@@ -59,6 +102,12 @@ def main() -> None:
         yolo_path=Path(args.yolo_path),
         segmodel_dir=Path(args.segmodel_dir),
         device=resolved_device,
+        cta_window_mode=args.cta_window_mode,
+        cta_window_level=args.cta_window_level,
+        cta_window_width=args.cta_window_width,
+        yolo_conf=args.yolo_conf,
+        roi_pad_xy=args.roi_pad_xy,
+        roi_pad_z=args.roi_pad_z,
     )
 
 

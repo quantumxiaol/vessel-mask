@@ -19,6 +19,45 @@ import cv2
 # Load .env from current working directory if present
 load_dotenv()
 
+
+def _env_raw(primary: str, secondary: str | None = None) -> str | None:
+    raw = os.getenv(primary)
+    if raw is None and secondary is not None:
+        raw = os.getenv(secondary)
+    if raw is None:
+        return None
+    return raw.strip()
+
+
+def _env_float(primary: str, secondary: str | None, default: float) -> float:
+    raw = _env_raw(primary, secondary)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{primary} must be a float, got: {raw!r}") from exc
+
+
+def _env_int(primary: str, secondary: str | None, default: int) -> int:
+    raw = _env_raw(primary, secondary)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{primary} must be an int, got: {raw!r}") from exc
+
+
+def _env_choice(primary: str, secondary: str | None, default: str, choices: set[str]) -> str:
+    raw = _env_raw(primary, secondary)
+    value = (raw or default).lower()
+    if value not in choices:
+        allowed = ", ".join(sorted(choices))
+        raise ValueError(f"{primary} must be one of [{allowed}], got: {value!r}")
+    return value
+
+
 YOLO_FILE_PATH = os.getenv(
     "TOPCOW_YOLO_FILE_PATH",
     os.getenv("VESSEL_MASK_YOLO_PATH", "./models/yolo-cow-detection.pt"),
@@ -32,6 +71,19 @@ SEGMENTATION_FOLDER = os.getenv("TOPCOW_SEGMENTATION_FOLDER", "./outputs_segment
 
 DEVICE_STR = os.getenv("TOPCOW_DEVICE", os.getenv("VESSEL_MASK_DEVICE", "cuda:0"))
 TORCH_LOAD_WEIGHTS_ONLY = os.getenv("TOPCOW_TORCH_LOAD_WEIGHTS_ONLY", "false").strip().lower()
+CTA_WINDOW_MODE = _env_choice("TOPCOW_CTA_WINDOW_MODE", "VESSEL_MASK_CTA_WINDOW_MODE", "auto", {"auto", "on", "off"})
+CTA_WINDOW_LEVEL = _env_float("TOPCOW_CTA_WINDOW_LEVEL", "VESSEL_MASK_CTA_WINDOW_LEVEL", 300.0)
+CTA_WINDOW_WIDTH = _env_float("TOPCOW_CTA_WINDOW_WIDTH", "VESSEL_MASK_CTA_WINDOW_WIDTH", 1000.0)
+YOLO_CONF = _env_float("TOPCOW_YOLO_CONF", "VESSEL_MASK_YOLO_CONF", 0.25)
+ROI_PAD_XY = _env_int("TOPCOW_ROI_PAD_XY", "VESSEL_MASK_ROI_PAD_XY", 10)
+ROI_PAD_Z = _env_int("TOPCOW_ROI_PAD_Z", "VESSEL_MASK_ROI_PAD_Z", 5)
+
+if CTA_WINDOW_WIDTH <= 0:
+    raise ValueError(f"CTA window width must be > 0, got: {CTA_WINDOW_WIDTH}")
+if not 0.0 <= YOLO_CONF <= 1.0:
+    raise ValueError(f"YOLO confidence must be within [0, 1], got: {YOLO_CONF}")
+if ROI_PAD_XY < 0 or ROI_PAD_Z < 0:
+    raise ValueError(f"ROI paddings must be >= 0, got: xy={ROI_PAD_XY}, z={ROI_PAD_Z}")
 #######################################################################################
 
 
@@ -62,6 +114,12 @@ def main():
     print("Output:", SEGMENTATION_FOLDER)
     print("Device:", DEVICE_STR)
     print("Resolved device:", resolve_device(DEVICE_STR))
+    print(
+        "CTA window:",
+        f"mode={CTA_WINDOW_MODE}, WL={CTA_WINDOW_LEVEL}, WW={CTA_WINDOW_WIDTH}",
+    )
+    print("YOLO conf:", YOLO_CONF)
+    print("ROI pad:", f"xy={ROI_PAD_XY}, z={ROI_PAD_Z}")
 
     if not os.path.exists(SEGMENTATION_FOLDER):
         os.makedirs(SEGMENTATION_FOLDER)
@@ -190,6 +248,19 @@ def window_CTA(CTA_array, WL=300, WW=1000):
     return windowed_CTA_array
 
 
+def _is_ct_case(nifti_path: str) -> bool:
+    filename = os.path.basename(nifti_path).lower()
+    return "cta" in filename or "_ct" in filename or filename.startswith("ct")
+
+
+def _should_apply_ct_window(nifti_path: str) -> bool:
+    if CTA_WINDOW_MODE == "on":
+        return True
+    if CTA_WINDOW_MODE == "off":
+        return False
+    return _is_ct_case(nifti_path)
+
+
 def process_nifti_with_yolo(model, nifti_path, output_crop_path, yolo_device):
     """
     Perform YOLO inference on each 2D slice of a NIfTI volume and output the cropped 3D volume.
@@ -200,6 +271,12 @@ def process_nifti_with_yolo(model, nifti_path, output_crop_path, yolo_device):
 
     # Squeeze the nifti_data to remove any singleton dimensions
     nifti_data = np.squeeze(nifti_data)
+
+    if _should_apply_ct_window(nifti_path):
+        print(
+            f"Applying CTA window to input volume (WL={CTA_WINDOW_LEVEL}, WW={CTA_WINDOW_WIDTH})."
+        )
+        nifti_data = window_CTA(nifti_data, WL=CTA_WINDOW_LEVEL, WW=CTA_WINDOW_WIDTH)
 
     # Initialize lists to store bounding box centers and sizes for each slice
     bbox_centers = []
@@ -227,7 +304,12 @@ def process_nifti_with_yolo(model, nifti_path, output_crop_path, yolo_device):
         # slice_rgb = np.stack((normalized_slice, normalized_slice, normalized_slice), axis=-1)
 
         # Perform YOLO inference on the 2D slice
-        results = model.predict(source=slice_rgb, verbose=False, device=yolo_device)
+        results = model.predict(
+            source=slice_rgb,
+            verbose=False,
+            device=yolo_device,
+            conf=YOLO_CONF,
+        )
 
         # Loop through detected bounding boxes
         for result in results:
@@ -251,10 +333,6 @@ def process_nifti_with_yolo(model, nifti_path, output_crop_path, yolo_device):
                 bbox_centers.append((center_x, center_y, slice_idx))
                 bbox_widths.append(width)
                 bbox_heights.append(height)
-
-    if "ct" in os.path.basename(nifti_path).lower():
-        print("CT modality detected. Windowing CTA volume!")
-        nifti_data = window_CTA(nifti_data)
 
     # If no bounding boxes were detected, return the original NIfTI data
     if not bbox_centers:
@@ -299,20 +377,26 @@ def process_nifti_with_yolo(model, nifti_path, output_crop_path, yolo_device):
     crop_z_min = max(0, median_center_z - crop_z_size // 2)
     crop_z_max = min(nifti_data.shape[2], median_center_z + crop_z_size // 2)
 
-    f_xy = 10
-    f_z = 5
-    cropped_volume = nifti_data[crop_y_min - f_xy : crop_y_max + f_xy,
-                     crop_x_min - f_xy : crop_x_max + f_xy,
-                     crop_z_min - f_z : crop_z_max + f_z ]
+    pad_xy = ROI_PAD_XY
+    pad_z = ROI_PAD_Z
+
+    y0 = max(0, crop_y_min - pad_xy)
+    y1 = min(nifti_data.shape[1], crop_y_max + pad_xy)
+    x0 = max(0, crop_x_min - pad_xy)
+    x1 = min(nifti_data.shape[0], crop_x_max + pad_xy)
+    z0 = max(0, crop_z_min - pad_z)
+    z1 = min(nifti_data.shape[2], crop_z_max + pad_z)
+
+    cropped_volume = nifti_data[y0:y1, x0:x1, z0:z1]
 
     # Save the cropped 3D volume as a NIfTI file
     save_nifti_file(cropped_volume, output_crop_path, nifti_path)
     print(f"Cropped volume saved with shape: {cropped_volume.shape}")
 
-    crop_dict = {"size": [crop_y_max + f_xy - (crop_y_min - f_xy),
-                          crop_x_max + f_xy - (crop_x_min - f_xy),
-                          crop_z_max + f_z - (crop_z_min - f_z)],
-                 "location": [crop_y_min - f_xy, crop_x_min - f_xy, crop_z_min - f_z]}
+    crop_dict = {
+        "size": [y1 - y0, x1 - x0, z1 - z0],
+        "location": [y0, x0, z0],
+    }
     print("Cropped dict:", crop_dict)
     print("Original size:", nifti_data.shape)
 

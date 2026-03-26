@@ -75,6 +75,12 @@ cp .env.example .env
 - `VESSEL_MASK_YOLO_PATH`：默认 `checkpoints/yolo-cow-detection.pt`
 - `VESSEL_MASK_SEGMODEL_DIR`：默认 `checkpoints/topcow-claim-models`
 - `VESSEL_MASK_REPO_DIR`：默认 `third_party/TopCoW_2024_MRA_winning_solution`
+- `VESSEL_MASK_CTA_WINDOW_MODE`：`auto` / `on` / `off`
+- `VESSEL_MASK_CTA_WINDOW_LEVEL`：CTA 窗位（默认 `300`）
+- `VESSEL_MASK_CTA_WINDOW_WIDTH`：CTA 窗宽（默认 `1000`）
+- `VESSEL_MASK_YOLO_CONF`：YOLO 置信度阈值（默认 `0.25`）
+- `VESSEL_MASK_ROI_PAD_XY`：ROI 在 `x/y` 方向扩边体素（默认 `10`）
+- `VESSEL_MASK_ROI_PAD_Z`：ROI 在 `z` 方向扩边体素（默认 `5`）
 
 ## 运行推理
 
@@ -85,6 +91,20 @@ uv run vessel-mask-topcow \
   --device auto
 ```
 
+若出现“大血管漏标较多”（常见于 ROI 偏紧）可先试这组参数：
+
+```bash
+uv run vessel-mask-topcow \
+  --input /path/case_cta.nii.gz \
+  --output /path/case_vessel_mask.nii.gz \
+  --cta-window-mode on \
+  --cta-window-level 300 \
+  --cta-window-width 700 \
+  --yolo-conf 0.18 \
+  --roi-pad-xy 18 \
+  --roi-pad-z 10
+```
+
 可选参数：
 
 - `--repo-dir`：TopCoW 仓库目录（默认 `third_party/TopCoW_2024_MRA_winning_solution`）
@@ -92,6 +112,12 @@ uv run vessel-mask-topcow \
 - `--segmodel-dir`：nnUNet 模型目录（默认 `checkpoints/topcow-claim-models`）
 - `--device`：`auto` / `cuda:0` / `cpu` / `mps`
 - `--env-file`：指定 dotenv 文件路径
+- `--cta-window-mode`：`auto` / `on` / `off`
+- `--cta-window-level`：CTA 窗位（WL）
+- `--cta-window-width`：CTA 窗宽（WW）
+- `--yolo-conf`：YOLO 置信度阈值（`0~1`）
+- `--roi-pad-xy`：ROI 在 `x/y` 方向扩边体素
+- `--roi-pad-z`：ROI 在 `z` 方向扩边体素
 
 ## 重要说明
 

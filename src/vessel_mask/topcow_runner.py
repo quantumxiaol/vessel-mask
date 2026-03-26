@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -75,6 +76,12 @@ def run_topcow_single(
     yolo_path: str | Path,
     segmodel_dir: str | Path,
     device: str = "cuda:0",
+    cta_window_mode: str = "auto",
+    cta_window_level: float = 300.0,
+    cta_window_width: float = 1000.0,
+    yolo_conf: float = 0.25,
+    roi_pad_xy: int = 10,
+    roi_pad_z: int = 5,
 ) -> None:
     repo_dir = Path(repo_dir).resolve()
     input_nifti = Path(input_nifti).resolve()
@@ -111,10 +118,19 @@ def run_topcow_single(
                 device=device,
             )
 
+            child_env = os.environ.copy()
+            child_env["TOPCOW_CTA_WINDOW_MODE"] = cta_window_mode
+            child_env["TOPCOW_CTA_WINDOW_LEVEL"] = str(cta_window_level)
+            child_env["TOPCOW_CTA_WINDOW_WIDTH"] = str(cta_window_width)
+            child_env["TOPCOW_YOLO_CONF"] = str(yolo_conf)
+            child_env["TOPCOW_ROI_PAD_XY"] = str(roi_pad_xy)
+            child_env["TOPCOW_ROI_PAD_Z"] = str(roi_pad_z)
+
             subprocess.run(
                 [sys.executable, str(patched_script)],
                 cwd=str(repo_dir),
                 check=True,
+                env=child_env,
             )
 
             output_candidates = sorted(out_dir.glob("*_seg.nii.gz"))
