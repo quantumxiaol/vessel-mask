@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import os
 import re
 import shutil
@@ -12,12 +13,30 @@ from vessel_mask.io import multiclass_to_binary_vessel_mask
 
 
 def _replace_assignment(script: str, name: str, value: str) -> str:
-    pattern = re.compile(rf"^{name}\s*=\s*.*$", flags=re.MULTILINE)
-    replacement = f"{name} = {value!r}"
-    patched, count = pattern.subn(replacement, script, count=1)
-    if count != 1:
+    """Replace one module-level assignment robustly, including multiline RHS."""
+    lines = script.splitlines(keepends=True)
+    module = ast.parse(script)
+    target_node: ast.Assign | ast.AnnAssign | None = None
+
+    for stmt in module.body:
+        if isinstance(stmt, ast.Assign):
+            for tgt in stmt.targets:
+                if isinstance(tgt, ast.Name) and tgt.id == name:
+                    target_node = stmt
+                    break
+        elif isinstance(stmt, ast.AnnAssign):
+            if isinstance(stmt.target, ast.Name) and stmt.target.id == name:
+                target_node = stmt
+        if target_node is not None:
+            break
+
+    if target_node is None or target_node.end_lineno is None:
         raise RuntimeError(f"Failed to patch assignment for {name}.")
-    return patched
+
+    replacement = f"{name} = {value!r}\n"
+    start_idx = target_node.lineno - 1
+    end_idx = target_node.end_lineno
+    return "".join(lines[:start_idx] + [replacement] + lines[end_idx:])
 
 
 def _patch_topcow_script(
